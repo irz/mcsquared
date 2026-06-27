@@ -1,4 +1,6 @@
 # mcsquared
+<img width="1250" height="602" alt="mcsquard" src="https://github.com/user-attachments/assets/7c154c73-397f-4c4b-b485-7e033166fe9f" />
+
 
 A fully static probabilistic sample player built around clocked Markov chains.
 

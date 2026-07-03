@@ -7,7 +7,7 @@ import {
 import { routeOrthogonalEdge, routeSelfEdge, routeToPath, type RoutePoint } from "../lib/edgeRouting";
 import { clockDivisionLabels, isClockEdge } from "../lib/clock";
 import { probabilityPercent } from "../lib/probability";
-import { NODE_BOX, type AppEdge, type AppNode } from "../types";
+import { NODE_BOX, SWING_PORTS, type AppEdge, type AppNode } from "../types";
 
 const routeMidpoint = (points: RoutePoint[]) => {
   if (points.length === 0) {
@@ -55,7 +55,8 @@ export function ProbabilityEdge({
   data,
   selected,
   source,
-  target
+  target,
+  sourceHandleId
 }: EdgeProps<AppEdge>) {
   const { getNodes } = useReactFlow<AppNode, AppEdge>();
   const isSelfEdge = source === target;
@@ -108,8 +109,12 @@ export function ProbabilityEdge({
             transform: `translate(-50%, -50%) translate(${routed.labelX}px, ${routed.labelY}px)`
           }}
         >
-          {isClockConnection && data?.clockDivision
-            ? clockDivisionLabels[data.clockDivision]
+          {isClockConnection
+            ? data?.clockDivision
+              ? clockDivisionLabels[data.clockDivision]
+              : sourceHandleId === SWING_PORTS.OUTPUT
+                ? "Swing"
+                : "Clock"
             : probabilityPercent(data?.probability ?? 0)}
         </div>
       </EdgeLabelRenderer>

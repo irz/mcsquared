@@ -7,6 +7,7 @@ import {
   NODE_PORTS,
   PATCH_STORAGE_KEY,
   SAMPLE_IDS,
+  SWING_PORTS,
   type AppEdge,
   type AppNode,
   type NumberedSampleId,
@@ -15,6 +16,7 @@ import {
 } from "../types";
 import { clockDivisionFromHandle, isClockEdge } from "./clock";
 import { normalizeEdgesBySource } from "./probability";
+import { clampSwingAmount, clampSwingChance } from "./swing";
 
 const clampBpm = (value: unknown) => {
   const numericValue = typeof value === "number" ? value : Number(value);
@@ -45,10 +47,11 @@ function parseNode(value: unknown): AppNode | null {
   const data = isObject(value.data) ? value.data : {};
 
   const isClockNode = value.id === MASTER_CLOCK_NODE_ID || value.type === "clockNode";
+  const isSwingNode = !isClockNode && value.type === "swingNode";
 
   return {
     id: isClockNode ? MASTER_CLOCK_NODE_ID : value.id,
-    type: isClockNode ? "clockNode" : "markovNode",
+    type: isClockNode ? "clockNode" : isSwingNode ? "swingNode" : "markovNode",
     position: { x, y },
     data: {
       label:
@@ -56,20 +59,28 @@ function parseNode(value: unknown): AppNode | null {
           ? data.label
           : isClockNode
             ? "Master Clock"
+            : isSwingNode
+              ? "Swing"
             : value.id,
-      sampleId: isClockNode ? null : parseSampleId(data.sampleId)
+      sampleId: isClockNode || isSwingNode ? null : parseSampleId(data.sampleId),
+      ...(isSwingNode
+        ? {
+            swingAmount: clampSwingAmount(data.swingAmount),
+            swingChance: clampSwingChance(data.swingChance)
+          }
+        : {})
     }
   };
 }
 
-function parseEdge(value: unknown, nodeIds: Set<string>): AppEdge | null {
+function parseEdge(value: unknown, nodesById: Map<string, AppNode>): AppEdge | null {
   if (
     !isObject(value) ||
     typeof value.id !== "string" ||
     typeof value.source !== "string" ||
     typeof value.target !== "string" ||
-    !nodeIds.has(value.source) ||
-    !nodeIds.has(value.target)
+    !nodesById.has(value.source) ||
+    !nodesById.has(value.target)
   ) {
     return null;
   }
@@ -79,7 +90,12 @@ function parseEdge(value: unknown, nodeIds: Set<string>): AppEdge | null {
     typeof value.sourceHandle === "string" ? value.sourceHandle : undefined;
   const rawTargetHandle =
     typeof value.targetHandle === "string" ? value.targetHandle : undefined;
-  const isClockConnection = value.source === MASTER_CLOCK_NODE_ID || data.edgeKind === "clock";
+  const sourceNode = nodesById.get(value.source);
+  const isMasterClockConnection = value.source === MASTER_CLOCK_NODE_ID;
+  const isSwingClockConnection =
+    sourceNode?.type === "swingNode" || rawSourceHandle === SWING_PORTS.OUTPUT;
+  const isClockConnection =
+    isMasterClockConnection || (data.edgeKind === "clock" && isSwingClockConnection);
   const clockDivision = isClockConnection
     ? clockDivisionFromHandle(rawSourceHandle) ??
       (typeof data.clockDivision === "string" ? data.clockDivision : undefined)
@@ -90,6 +106,18 @@ function parseEdge(value: unknown, nodeIds: Set<string>): AppEdge | null {
       : 0;
   const isSelfEdge = value.source === value.target;
 
+  if (isSwingClockConnection && !isMasterClockConnection) {
+    return {
+      id: value.id,
+      source: value.source,
+      target: value.target,
+      sourceHandle: SWING_PORTS.OUTPUT,
+      targetHandle: NODE_PORTS.INPUT,
+      type: "probabilityEdge",
+      data: { edgeKind: "clock" }
+    };
+  }
+
   return {
     id: value.id,
     source: value.source,
@@ -99,7 +127,11 @@ function parseEdge(value: unknown, nodeIds: Set<string>): AppEdge | null {
       : isSelfEdge
         ? NODE_PORTS.SELF_SOURCE
         : NODE_PORTS.OUTPUT,
-    targetHandle: isSelfEdge ? NODE_PORTS.SELF_TARGET : NODE_PORTS.INPUT,
+    targetHandle: isSelfEdge
+      ? NODE_PORTS.SELF_TARGET
+      : rawTargetHandle === SWING_PORTS.INPUT
+        ? SWING_PORTS.INPUT
+        : NODE_PORTS.INPUT,
     type: "probabilityEdge",
     data: isClockConnection
       ? {
@@ -146,9 +178,10 @@ export function sanitizePatch(value: unknown): PatchState | null {
     ...markovNodes.slice(0, MAX_NODES)
   ];
   const nodeIds = new Set(limitedNodes.map((node) => node.id));
+  const nodesById = new Map(limitedNodes.map((node) => [node.id, node]));
   const rawEdges = Array.isArray(value.edges) ? value.edges : [];
   const edges = rawEdges
-    .map((edge) => parseEdge(edge, nodeIds))
+    .map((edge) => parseEdge(edge, nodesById))
     .filter((edge): edge is AppEdge => edge !== null);
   const legacyStartNodeId =
     typeof value.startNodeId === "string" && nodeIds.has(value.startNodeId)

@@ -1,9 +1,12 @@
 import {
   CLOCK_PORTS,
   MASTER_CLOCK_NODE_ID,
+  SWING_PORTS,
   type AppEdge,
+  type AppNode,
   type ClockDivision
 } from "../types";
+import { clampSwingAmount, clampSwingChance } from "./swing";
 
 export const clockDivisionLabels: Record<ClockDivision, string> = {
   whole: "Whole",
@@ -59,6 +62,82 @@ export function clockEdges(edges: AppEdge[]) {
   return edges.filter(isClockEdge);
 }
 
+export type ClockLane = {
+  id: string;
+  clockEdgeId: string;
+  routeEdgeIds: string[];
+  targetNodeId: string;
+  clockDivision: ClockDivision;
+  swingNodeId?: string;
+  swingAmount?: number;
+  swingChance?: number;
+};
+
+export function clockLanes(nodes: AppNode[], edges: AppEdge[]): ClockLane[] {
+  const nodesById = new Map(nodes.map((node) => [node.id, node]));
+  const outgoingClockEdgesBySource = new Map<string, AppEdge[]>();
+
+  for (const edge of edges) {
+    if (!isClockEdge(edge)) {
+      continue;
+    }
+
+    if (!outgoingClockEdgesBySource.has(edge.source)) {
+      outgoingClockEdgesBySource.set(edge.source, []);
+    }
+
+    outgoingClockEdgesBySource.get(edge.source)!.push(edge);
+  }
+
+  const lanes: ClockLane[] = [];
+  const masterEdges = outgoingClockEdgesBySource.get(MASTER_CLOCK_NODE_ID) ?? [];
+
+  for (const clockEdge of masterEdges) {
+    const targetNode = nodesById.get(clockEdge.target);
+    const clockDivision =
+      clockEdge.data?.clockDivision ?? clockDivisionFromHandle(clockEdge.sourceHandle) ?? "quarter";
+
+    if (targetNode?.type === "markovNode") {
+      lanes.push({
+        id: clockEdge.id,
+        clockEdgeId: clockEdge.id,
+        routeEdgeIds: [clockEdge.id],
+        targetNodeId: clockEdge.target,
+        clockDivision
+      });
+      continue;
+    }
+
+    if (targetNode?.type !== "swingNode") {
+      continue;
+    }
+
+    const swingEdges = outgoingClockEdgesBySource.get(targetNode.id) ?? [];
+
+    for (const swingEdge of swingEdges) {
+      if (
+        swingEdge.sourceHandle !== SWING_PORTS.OUTPUT ||
+        nodesById.get(swingEdge.target)?.type !== "markovNode"
+      ) {
+        continue;
+      }
+
+      lanes.push({
+        id: `${clockEdge.id}:${swingEdge.id}`,
+        clockEdgeId: clockEdge.id,
+        routeEdgeIds: [clockEdge.id, swingEdge.id],
+        targetNodeId: swingEdge.target,
+        clockDivision,
+        swingNodeId: targetNode.id,
+        swingAmount: clampSwingAmount(targetNode.data.swingAmount),
+        swingChance: clampSwingChance(targetNode.data.swingChance)
+      });
+    }
+  }
+
+  return lanes;
+}
+
 export function reconcileClockLanes(
   edges: AppEdge[],
   nodeIds: Set<string>,
@@ -73,6 +152,28 @@ export function reconcileClockLanes(
 
     const activeNodeId = activeLaneNodeIds.get(edge.id);
     nextLaneNodeIds.set(edge.id, activeNodeId && nodeIds.has(activeNodeId) ? activeNodeId : edge.target);
+  }
+
+  return nextLaneNodeIds;
+}
+
+export function reconcileClockLaneNodes(
+  lanes: ClockLane[],
+  nodeIds: Set<string>,
+  activeLaneNodeIds: Map<string, string>
+) {
+  const nextLaneNodeIds = new Map<string, string>();
+
+  for (const lane of lanes) {
+    if (!nodeIds.has(lane.targetNodeId)) {
+      continue;
+    }
+
+    const activeNodeId = activeLaneNodeIds.get(lane.id);
+    nextLaneNodeIds.set(
+      lane.id,
+      activeNodeId && nodeIds.has(activeNodeId) ? activeNodeId : lane.targetNodeId
+    );
   }
 
   return nextLaneNodeIds;

@@ -18,7 +18,12 @@ export class SampleEngine {
 
   playSample(sampleId: NumberedSampleId) {
     const context = this.getContext();
-    const now = context.currentTime;
+    this.playSampleAt(sampleId, context.currentTime);
+  }
+
+  playSampleAt(sampleId: NumberedSampleId, scheduledTime: number) {
+    const context = this.getContext();
+    const now = Math.max(0, scheduledTime);
 
     switch (sampleId) {
       case 1:
@@ -46,6 +51,10 @@ export class SampleEngine {
         this.playChord(context, now);
         break;
     }
+  }
+
+  getCurrentTime() {
+    return this.getContext().currentTime;
   }
 
   stopAll() {
@@ -91,7 +100,11 @@ export class SampleEngine {
     gain.gain.exponentialRampToValueAtTime(Math.max(0.0001, peak), start + 0.006);
     gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
     gain.connect(context.destination);
-    window.setTimeout(() => gain.disconnect(), (duration + ACTIVE_RELEASE_SECONDS) * 1000);
+    const disconnectDelayMs = Math.max(
+      0,
+      (start - context.currentTime + duration + ACTIVE_RELEASE_SECONDS) * 1000
+    );
+    window.setTimeout(() => gain.disconnect(), disconnectDelayMs);
     return gain;
   }
 

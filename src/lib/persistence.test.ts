@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { CLOCK_PORTS, MASTER_CLOCK_NODE_ID, MAX_BPM, MAX_NODES, MIN_BPM } from "../types";
+import {
+  CLOCK_PORTS,
+  MASTER_CLOCK_NODE_ID,
+  MAX_BPM,
+  MAX_NODES,
+  MIN_BPM,
+  NODE_PORTS,
+  SWING_PORTS
+} from "../types";
 import { parseStoredPatch, sanitizePatch } from "./persistence";
 
 describe("persistence helpers", () => {
@@ -49,5 +57,56 @@ describe("persistence helpers", () => {
 
     expect(patch?.nodes).toHaveLength(MAX_NODES + 1);
     expect(patch?.nodes[0].id).toBe(MASTER_CLOCK_NODE_ID);
+  });
+
+  it("sanitizes swing nodes and clock routes through them", () => {
+    const patch = sanitizePatch({
+      version: 1,
+      bpm: 112,
+      nodes: [
+        { id: MASTER_CLOCK_NODE_ID, type: "clockNode", position: { x: 0, y: 0 }, data: {} },
+        {
+          id: "swing-a",
+          type: "swingNode",
+          position: { x: 10, y: 20 },
+          data: { label: "Lazy Swing", swingAmount: 0.62, swingChance: 0.42 }
+        },
+        { id: "hat", type: "markovNode", position: { x: 30, y: 40 }, data: { label: "Hat", sampleId: 3 } }
+      ],
+      edges: [
+        {
+          id: "clock-to-swing",
+          source: MASTER_CLOCK_NODE_ID,
+          target: "swing-a",
+          sourceHandle: CLOCK_PORTS.SIXTEENTH,
+          targetHandle: SWING_PORTS.INPUT,
+          data: { edgeKind: "clock", clockDivision: "sixteenth" }
+        },
+        {
+          id: "swing-to-hat",
+          source: "swing-a",
+          target: "hat",
+          sourceHandle: SWING_PORTS.OUTPUT,
+          targetHandle: NODE_PORTS.INPUT,
+          data: { edgeKind: "clock" }
+        }
+      ]
+    });
+
+    expect(patch?.nodes[1]).toMatchObject({
+      id: "swing-a",
+      type: "swingNode",
+      data: { label: "Lazy Swing", swingAmount: 0.62, swingChance: 0.42 }
+    });
+    expect(patch?.edges[0]).toMatchObject({
+      sourceHandle: CLOCK_PORTS.SIXTEENTH,
+      targetHandle: SWING_PORTS.INPUT,
+      data: { edgeKind: "clock", clockDivision: "sixteenth" }
+    });
+    expect(patch?.edges[1]).toMatchObject({
+      sourceHandle: SWING_PORTS.OUTPUT,
+      targetHandle: NODE_PORTS.INPUT,
+      data: { edgeKind: "clock" }
+    });
   });
 });

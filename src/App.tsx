@@ -19,6 +19,7 @@ import {
   MousePointer2,
   Plus,
   RotateCcw,
+  Shuffle,
   Square,
   Trash2,
   Volume2,
@@ -28,14 +29,15 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ClockNode } from "./components/ClockNode";
 import { MarkovNode } from "./components/MarkovNode";
 import { ProbabilityEdge } from "./components/ProbabilityEdge";
+import { SwingNode } from "./components/SwingNode";
 import {
   clockDivisionFromHandle,
   clockDivisionLabels,
-  clockEdges,
+  clockLanes,
   divisionsForSixteenthTick,
   isClockEdge,
   isTransitionEdge,
-  reconcileClockLanes,
+  reconcileClockLaneNodes,
   sixteenthIntervalMs
 } from "./lib/clock";
 import { chooseNextNodeId } from "./lib/markov";
@@ -48,6 +50,13 @@ import {
 import { loadStoredPatch, saveStoredPatch } from "./lib/persistence";
 import { SampleEngine } from "./lib/audioEngine";
 import {
+  DEFAULT_SWING_AMOUNT,
+  DEFAULT_SWING_CHANCE,
+  clampSwingAmount,
+  clampSwingChance,
+  swingDelaySeconds
+} from "./lib/swing";
+import {
   MAX_BPM,
   MAX_NODES,
   MASTER_CLOCK_NODE_ID,
@@ -55,6 +64,7 @@ import {
   NODE_PORTS,
   CLOCK_PORTS,
   SAMPLE_IDS,
+  SWING_PORTS,
   type AppEdge,
   type AppNode,
   type ClockDivision,
@@ -75,7 +85,7 @@ const sampleNames: Record<NumberedSampleId, string> = {
   8: "Chord"
 };
 
-const nodeTypes = { markovNode: MarkovNode, clockNode: ClockNode };
+const nodeTypes = { markovNode: MarkovNode, clockNode: ClockNode, swingNode: SwingNode };
 const edgeTypes = { probabilityEdge: ProbabilityEdge };
 
 const markerEnd = {
@@ -91,6 +101,9 @@ const clockOutputHandles = new Set<string>([
   CLOCK_PORTS.EIGHTH,
   CLOCK_PORTS.SIXTEENTH
 ]);
+
+const SCHEDULE_AHEAD_SECONDS = 0.12;
+const SCHEDULER_LOOKAHEAD_MS = 25;
 
 const createClockNode = (bpm: number): AppNode => ({
   id: MASTER_CLOCK_NODE_ID,
@@ -115,7 +128,9 @@ const createEdge = (connection: Connection): AppEdge | null => {
     return null;
   }
 
-  const isClockConnection = connection.source === MASTER_CLOCK_NODE_ID;
+  const isMasterClockConnection = connection.source === MASTER_CLOCK_NODE_ID;
+  const isSwingClockConnection = connection.sourceHandle === SWING_PORTS.OUTPUT;
+  const isClockConnection = isMasterClockConnection || isSwingClockConnection;
   const isSelfEdge = connection.source === connection.target;
   const clockDivision = clockDivisionFromHandle(connection.sourceHandle);
 
@@ -124,15 +139,23 @@ const createEdge = (connection: Connection): AppEdge | null => {
     source: connection.source,
     target: connection.target,
     sourceHandle: isClockConnection
-      ? connection.sourceHandle
+      ? isSwingClockConnection
+        ? SWING_PORTS.OUTPUT
+        : connection.sourceHandle
       : isSelfEdge
         ? NODE_PORTS.SELF_SOURCE
         : NODE_PORTS.OUTPUT,
-    targetHandle: isSelfEdge ? NODE_PORTS.SELF_TARGET : NODE_PORTS.INPUT,
+    targetHandle: isSelfEdge
+      ? NODE_PORTS.SELF_TARGET
+      : connection.targetHandle === SWING_PORTS.INPUT
+        ? SWING_PORTS.INPUT
+        : NODE_PORTS.INPUT,
     type: "probabilityEdge",
     markerEnd,
-    data: isClockConnection
+    data: isMasterClockConnection
       ? { edgeKind: "clock", clockDivision: clockDivision ?? "quarter" }
+      : isSwingClockConnection
+        ? { edgeKind: "clock" }
       : { edgeKind: "transition", probability: 0 }
   };
 };
@@ -153,12 +176,20 @@ const isDisciplinedConnection = (connection: {
     return (
       connection.target !== MASTER_CLOCK_NODE_ID &&
       Boolean(connection.sourceHandle && clockOutputHandles.has(connection.sourceHandle)) &&
-      connection.targetHandle === NODE_PORTS.INPUT
+      (connection.targetHandle === NODE_PORTS.INPUT || connection.targetHandle === SWING_PORTS.INPUT)
     );
   }
 
   if (connection.target === MASTER_CLOCK_NODE_ID) {
     return false;
+  }
+
+  if (connection.targetHandle === SWING_PORTS.INPUT) {
+    return false;
+  }
+
+  if (connection.sourceHandle === SWING_PORTS.OUTPUT) {
+    return connection.source !== connection.target && connection.targetHandle === NODE_PORTS.INPUT;
   }
 
   if (isSelfEdge) {
@@ -200,6 +231,18 @@ const hasDuplicateConnection = (
 
 const withDisciplinedEdgeHandles = (edge: AppEdge): AppEdge => {
   if (isClockEdge(edge)) {
+    if (edge.source !== MASTER_CLOCK_NODE_ID) {
+      return {
+        ...edge,
+        sourceHandle: SWING_PORTS.OUTPUT,
+        targetHandle: NODE_PORTS.INPUT,
+        markerEnd: edge.markerEnd ?? markerEnd,
+        data: {
+          edgeKind: "clock"
+        }
+      };
+    }
+
     const clockDivision = edge.data?.clockDivision ?? clockDivisionFromHandle(edge.sourceHandle);
 
     return {
@@ -208,7 +251,7 @@ const withDisciplinedEdgeHandles = (edge: AppEdge): AppEdge => {
         edge.sourceHandle && clockOutputHandles.has(edge.sourceHandle)
           ? edge.sourceHandle
           : CLOCK_PORTS.QUARTER,
-      targetHandle: NODE_PORTS.INPUT,
+      targetHandle: edge.targetHandle === SWING_PORTS.INPUT ? SWING_PORTS.INPUT : NODE_PORTS.INPUT,
       markerEnd: edge.markerEnd ?? markerEnd,
       data: {
         ...edge.data,
@@ -330,6 +373,7 @@ function App() {
   const [edges, setEdges] = useState<AppEdge[]>(initialPatch.edges);
   const [bpm, setBpm] = useState(initialPatch.bpm);
   const [activeNodeIds, setActiveNodeIds] = useState<string[]>([]);
+  const [activeEdgeIds, setActiveEdgeIds] = useState<string[]>([]);
   const [isPlaying, setIsPlaying] = useState(false);
   const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>([]);
   const [selectedEdgeIds, setSelectedEdgeIds] = useState<string[]>([]);
@@ -350,17 +394,17 @@ function App() {
     ? nodes.find((node) => node.id === selectedEdge.target)
     : undefined;
   const selectedNodeOutgoingEdges = selectedNode
-    ? edges.filter((edge) => edge.source === selectedNode.id && isTransitionEdge(edge))
+    ? edges.filter(
+        (edge) => selectedNode.type === "markovNode" && edge.source === selectedNode.id && isTransitionEdge(edge)
+      )
     : [];
-  const markovNodes = nodes.filter((node) => node.id !== MASTER_CLOCK_NODE_ID);
-  const connectedClockEdges = clockEdges(edges);
-  const validClockEdges = connectedClockEdges.filter((edge) =>
-    nodes.some((node) => node.id === edge.target)
-  );
-  const clockRouteCounts = validClockEdges.reduce<Record<ClockDivision, number>>(
+  const editableNodes = nodes.filter((node) => node.id !== MASTER_CLOCK_NODE_ID);
+  const markovNodes = nodes.filter((node) => node.type === "markovNode");
+  const swingNodes = nodes.filter((node) => node.type === "swingNode");
+  const validClockLanes = clockLanes(nodes, edges);
+  const clockRouteCounts = validClockLanes.reduce<Record<ClockDivision, number>>(
     (counts, edge) => {
-      const division = edge.data?.clockDivision ?? "quarter";
-      counts[division] += 1;
+      counts[edge.clockDivision] += 1;
       return counts;
     },
     { whole: 0, quarter: 0, eighth: 0, sixteenth: 0 }
@@ -396,12 +440,14 @@ function App() {
       return;
     }
 
-    activeLaneNodeIdsRef.current = reconcileClockLanes(
-      edges,
+    const nextClockLanes = clockLanes(nodes, edges);
+    activeLaneNodeIdsRef.current = reconcileClockLaneNodes(
+      nextClockLanes,
       new Set(nodes.map((node) => node.id)),
       activeLaneNodeIdsRef.current
     );
     setActiveNodeIds(Array.from(new Set(activeLaneNodeIdsRef.current.values())));
+    setActiveEdgeIds(Array.from(new Set(nextClockLanes.flatMap((lane) => lane.routeEdgeIds))));
   }, [edges, isPlaying, nodes]);
 
   useEffect(() => {
@@ -410,60 +456,112 @@ function App() {
     }
 
     let timerId: number | undefined;
+    const visualTimerIds = new Set<number>();
     let cancelled = false;
     let sixteenthTickIndex = 0;
+    let nextTickTime = engineRef.current.getCurrentTime();
+
+    const scheduleVisualUpdate = (scheduledTime: number, nodeIds: string[], edgeIds: string[]) => {
+      const delayMs = Math.max(0, (scheduledTime - engineRef.current.getCurrentTime()) * 1000);
+      const visualTimerId = window.setTimeout(() => {
+        visualTimerIds.delete(visualTimerId);
+
+        if (cancelled) {
+          return;
+        }
+
+        setActiveNodeIds(nodeIds);
+        setActiveEdgeIds(edgeIds);
+      }, delayMs);
+
+      visualTimerIds.add(visualTimerId);
+    };
 
     const tick = () => {
       const latestNodes = nodesRef.current;
       const latestEdges = edgesRef.current;
       const nodeIds = new Set(latestNodes.map((node) => node.id));
-      const dueDivisions = new Set(divisionsForSixteenthTick(sixteenthTickIndex));
-      const latestClockEdges = clockEdges(latestEdges);
-      const nextLaneNodeIds = reconcileClockLanes(
-        latestEdges,
+      const nodesById = new Map(latestNodes.map((node) => [node.id, node]));
+      const latestClockLanes = clockLanes(latestNodes, latestEdges);
+      let nextLaneNodeIds = reconcileClockLaneNodes(
+        latestClockLanes,
         nodeIds,
         activeLaneNodeIdsRef.current
       );
+      const currentTime = engineRef.current.getCurrentTime();
 
-      for (const clockEdge of latestClockEdges) {
-        const clockDivision = clockEdge.data?.clockDivision ?? "quarter";
+      while (nextTickTime < currentTime + SCHEDULE_AHEAD_SECONDS) {
+        const dueDivisions = new Set(divisionsForSixteenthTick(sixteenthTickIndex));
+        const firedEdgeIds = new Set<string>();
+        let visualTime = nextTickTime;
 
-        if (!dueDivisions.has(clockDivision) || !nodeIds.has(clockEdge.target)) {
-          continue;
+        for (const lane of latestClockLanes) {
+          if (!dueDivisions.has(lane.clockDivision) || !nodeIds.has(lane.targetNodeId)) {
+            continue;
+          }
+
+          const activeNodeId = nodeIds.has(nextLaneNodeIds.get(lane.id) ?? "")
+            ? nextLaneNodeIds.get(lane.id)!
+            : lane.targetNodeId;
+          const activeNode = nodesById.get(activeNodeId);
+          const swingDelay = lane.swingNodeId
+            ? swingDelaySeconds(
+                bpmRef.current,
+                lane.clockDivision,
+                sixteenthTickIndex,
+                lane.swingAmount,
+                lane.swingChance
+              )
+            : 0;
+          const scheduledTime = Math.max(
+            nextTickTime + swingDelay,
+            engineRef.current.getCurrentTime() + 0.002
+          );
+
+          if (activeNode?.data.sampleId) {
+            engineRef.current.playSampleAt(activeNode.data.sampleId, scheduledTime);
+          }
+
+          nextLaneNodeIds.set(lane.id, chooseNextNodeId(activeNodeId, latestEdges));
+          lane.routeEdgeIds.forEach((edgeId) => firedEdgeIds.add(edgeId));
+          visualTime = Math.max(visualTime, scheduledTime);
         }
 
-        const activeNodeId = nodeIds.has(nextLaneNodeIds.get(clockEdge.id) ?? "")
-          ? nextLaneNodeIds.get(clockEdge.id)!
-          : clockEdge.target;
-        const activeNode = latestNodes.find((node) => node.id === activeNodeId);
+        activeLaneNodeIdsRef.current = nextLaneNodeIds;
 
-        if (activeNode?.data.sampleId) {
-          engineRef.current.playSample(activeNode.data.sampleId);
+        if (firedEdgeIds.size > 0) {
+          scheduleVisualUpdate(
+            visualTime,
+            Array.from(new Set(nextLaneNodeIds.values())),
+            Array.from(firedEdgeIds)
+          );
         }
 
-        nextLaneNodeIds.set(clockEdge.id, chooseNextNodeId(activeNodeId, latestEdges));
+        nextTickTime += sixteenthIntervalMs(bpmRef.current) / 1000;
+        sixteenthTickIndex += 1;
       }
 
-      activeLaneNodeIdsRef.current = nextLaneNodeIds;
-      setActiveNodeIds(Array.from(new Set(activeLaneNodeIdsRef.current.values())));
-      sixteenthTickIndex += 1;
-
       if (!cancelled) {
-        timerId = window.setTimeout(tick, sixteenthIntervalMs(bpmRef.current));
+        timerId = window.setTimeout(tick, SCHEDULER_LOOKAHEAD_MS);
       }
     };
 
-    timerId = window.setTimeout(tick, 0);
+    tick();
 
     return () => {
       cancelled = true;
       if (timerId) {
         window.clearTimeout(timerId);
       }
+      for (const visualTimerId of visualTimerIds) {
+        window.clearTimeout(visualTimerId);
+      }
+      visualTimerIds.clear();
     };
   }, [isPlaying]);
 
   const activeNodeIdSet = useMemo(() => new Set(activeNodeIds), [activeNodeIds]);
+  const activeEdgeIdSet = useMemo(() => new Set(activeEdgeIds), [activeEdgeIds]);
 
   const displayNodes = useMemo(
     () =>
@@ -489,16 +587,16 @@ function App() {
         animated:
           isPlaying &&
           (activeNodeIdSet.has(edge.source) ||
-            (isClockEdge(edge) && activeLaneNodeIdsRef.current.has(edge.id))),
+            (isClockEdge(edge) && activeEdgeIdSet.has(edge.id))),
         selectable: true,
         reconnectable: true
       })),
-    [activeNodeIdSet, edges, isPlaying]
+    [activeEdgeIdSet, activeNodeIdSet, edges, isPlaying]
   );
 
   const addNodeAt = useCallback(
     (position: { x: number; y: number }, sampleId: SampleId = null) => {
-      if (markovNodes.length >= MAX_NODES) {
+      if (editableNodes.length >= MAX_NODES) {
         return;
       }
 
@@ -517,15 +615,40 @@ function App() {
       setSelectedNodeIds([nodeId]);
       setSelectedEdgeIds([]);
     },
-    [markovNodes.length]
+    [editableNodes.length, markovNodes.length]
   );
 
   const addNode = useCallback(() => {
     addNodeAt({
-      x: 140 + (markovNodes.length % 8) * 52,
-      y: 120 + (markovNodes.length % 6) * 46
+      x: 140 + (editableNodes.length % 8) * 52,
+      y: 120 + (editableNodes.length % 6) * 46
     });
-  }, [addNodeAt, markovNodes.length]);
+  }, [addNodeAt, editableNodes.length]);
+
+  const addSwingNode = useCallback(() => {
+    if (editableNodes.length >= MAX_NODES) {
+      return;
+    }
+
+    const nodeId = createId("swing");
+    const nextNode: AppNode = {
+      id: nodeId,
+      type: "swingNode",
+      position: {
+        x: 220 + (editableNodes.length % 7) * 56,
+        y: 180 + (editableNodes.length % 5) * 52
+      },
+      data: {
+        label: `Swing ${swingNodes.length + 1}`,
+        swingAmount: DEFAULT_SWING_AMOUNT,
+        swingChance: DEFAULT_SWING_CHANCE
+      }
+    };
+
+    setNodes((previousNodes) => [...previousNodes, nextNode]);
+    setSelectedNodeIds([nodeId]);
+    setSelectedEdgeIds([]);
+  }, [editableNodes.length, swingNodes.length]);
 
   const onNodesChange = useCallback(
     (changes: NodeChange<AppNode>[]) => {
@@ -726,20 +849,22 @@ function App() {
     setSelectedNodeIds([]);
     setSelectedEdgeIds([]);
     setActiveNodeIds([]);
+    setActiveEdgeIds([]);
     activeLaneNodeIdsRef.current.clear();
   }, [bpm]);
 
   const startPlayback = useCallback(() => {
-    const validEdges = clockEdges(edges).filter((edge) =>
-      nodes.some((node) => node.id === edge.target)
-    );
+    const validLanes = clockLanes(nodes, edges);
 
-    if (isPlaying || validEdges.length === 0) {
+    if (isPlaying || validLanes.length === 0) {
       return;
     }
 
-    activeLaneNodeIdsRef.current = new Map(validEdges.map((edge) => [edge.id, edge.target]));
-    setActiveNodeIds(Array.from(new Set(validEdges.map((edge) => edge.target))));
+    activeLaneNodeIdsRef.current = new Map(
+      validLanes.map((lane) => [lane.id, lane.targetNodeId])
+    );
+    setActiveNodeIds(Array.from(new Set(validLanes.map((lane) => lane.targetNodeId))));
+    setActiveEdgeIds(Array.from(new Set(validLanes.flatMap((lane) => lane.routeEdgeIds))));
     setSelectedNodeIds([]);
     setSelectedEdgeIds([]);
 
@@ -751,6 +876,7 @@ function App() {
   const stopPlayback = useCallback(() => {
     setIsPlaying(false);
     setActiveNodeIds([]);
+    setActiveEdgeIds([]);
     activeLaneNodeIdsRef.current.clear();
     engineRef.current.stopAll();
   }, []);
@@ -823,6 +949,11 @@ function App() {
 
   const selectedEdgeProbability = selectedEdge?.data?.probability ?? 0;
   const selectedEdgeIsClock = selectedEdge ? isClockEdge(selectedEdge) : false;
+  const selectedEdgeClockLabel = selectedEdge?.data?.clockDivision
+    ? clockDivisionLabels[selectedEdge.data.clockDivision]
+    : selectedEdge?.sourceHandle === SWING_PORTS.OUTPUT
+      ? "Swing"
+      : "-";
   const canDelete =
     selectedNodeIds.some((nodeId) => nodeId !== MASTER_CLOCK_NODE_ID) || selectedEdgeIds.length > 0;
 
@@ -842,7 +973,7 @@ function App() {
             className="transport-button play"
             type="button"
             onClick={startPlayback}
-            disabled={isPlaying || validClockEdges.length === 0}
+            disabled={isPlaying || validClockLanes.length === 0}
             title="Play"
           >
             <Play size={18} aria-hidden="true" />
@@ -879,15 +1010,24 @@ function App() {
         </div>
 
         <div className="toolbar">
-          <button type="button" onClick={addNode} disabled={markovNodes.length >= MAX_NODES} title="Add node">
+          <button type="button" onClick={addNode} disabled={editableNodes.length >= MAX_NODES} title="Add node">
             <Plus size={17} aria-hidden="true" />
             <span>Add</span>
+          </button>
+          <button
+            type="button"
+            onClick={addSwingNode}
+            disabled={editableNodes.length >= MAX_NODES}
+            title="Add swing node"
+          >
+            <Shuffle size={17} aria-hidden="true" />
+            <span>Swing</span>
           </button>
           <button type="button" onClick={deleteSelected} disabled={!canDelete} title="Delete selected">
             <Trash2 size={17} aria-hidden="true" />
             <span>Delete</span>
           </button>
-          <button type="button" onClick={clearGraph} disabled={markovNodes.length === 0} title="Clear graph">
+          <button type="button" onClick={clearGraph} disabled={editableNodes.length === 0} title="Clear graph">
             <RotateCcw size={17} aria-hidden="true" />
             <span>Clear</span>
           </button>
@@ -903,10 +1043,10 @@ function App() {
           <div className="sample-list">
             <button
               className="sample-tile silent"
-              draggable={markovNodes.length < MAX_NODES}
+              draggable={editableNodes.length < MAX_NODES}
               onDragStart={(event) => onDragStart(event, null)}
               type="button"
-              disabled={markovNodes.length >= MAX_NODES}
+              disabled={editableNodes.length >= MAX_NODES}
               title="Drag silent node"
             >
               <span className="sample-swatch" />
@@ -916,11 +1056,11 @@ function App() {
               <button
                 key={sampleId}
                 className={`sample-tile sample-${sampleId}`}
-                draggable={markovNodes.length < MAX_NODES}
+                draggable={editableNodes.length < MAX_NODES}
                 onClick={() => previewSample(sampleId)}
                 onDragStart={(event) => onDragStart(event, sampleId)}
                 type="button"
-                disabled={markovNodes.length >= MAX_NODES}
+                disabled={editableNodes.length >= MAX_NODES}
                 title={`Preview or drag ${sampleNames[sampleId]}`}
               >
                 <span className="sample-swatch" />
@@ -931,7 +1071,7 @@ function App() {
           <div className="node-counter">
             <MousePointer2 size={15} aria-hidden="true" />
             <span>
-              {markovNodes.length}/{MAX_NODES}
+              {editableNodes.length}/{MAX_NODES}
             </span>
           </div>
         </aside>
@@ -972,7 +1112,9 @@ function App() {
                   ? "#f97316"
                   : node.id === MASTER_CLOCK_NODE_ID
                     ? "#0f9f86"
-                    : "#71685f"
+                    : node.type === "swingNode"
+                      ? "#8b3fd1"
+                      : "#71685f"
               }
             />
           </ReactFlow>
@@ -999,7 +1141,7 @@ function App() {
               <div className="patch-stats">
                 <div>
                   <span>Routes</span>
-                  <strong>{validClockEdges.length}</strong>
+                  <strong>{validClockLanes.length}</strong>
                 </div>
                 <div>
                   <span>Active</span>
@@ -1011,7 +1153,56 @@ function App() {
                 </div>
               </div>
             </div>
-          ) : selectedNode ? (
+          ) : selectedNode?.type === "swingNode" ? (
+            <div className="inspector-stack">
+              <label className="field">
+                <span>Label</span>
+                <input
+                  type="text"
+                  value={selectedNode.data.label}
+                  onChange={(event) => updateSelectedNodeData({ label: event.target.value })}
+                />
+              </label>
+              <label className="field">
+                <span>Amount</span>
+                <input
+                  type="range"
+                  min={50}
+                  max={75}
+                  value={Math.round(clampSwingAmount(selectedNode.data.swingAmount) * 100)}
+                  onChange={(event) =>
+                    updateSelectedNodeData({
+                      swingAmount: Number(event.target.value) / 100
+                    })
+                  }
+                />
+              </label>
+              <label className="field">
+                <span>Chance</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  value={Math.round(clampSwingChance(selectedNode.data.swingChance) * 100)}
+                  onChange={(event) =>
+                    updateSelectedNodeData({
+                      swingChance: Number(event.target.value) / 100
+                    })
+                  }
+                />
+              </label>
+              <div className="patch-stats">
+                <div>
+                  <span>Amount</span>
+                  <strong>{Math.round(clampSwingAmount(selectedNode.data.swingAmount) * 100)}%</strong>
+                </div>
+                <div>
+                  <span>Chance</span>
+                  <strong>{Math.round(clampSwingChance(selectedNode.data.swingChance) * 100)}%</strong>
+                </div>
+              </div>
+            </div>
+          ) : selectedNode?.type === "markovNode" ? (
             <div className="inspector-stack">
               <label className="field">
                 <span>Label</span>
@@ -1090,11 +1281,7 @@ function App() {
                 <div className="patch-stats">
                   <div>
                     <span>Clock</span>
-                    <strong>
-                      {selectedEdge.data?.clockDivision
-                        ? clockDivisionLabels[selectedEdge.data.clockDivision]
-                        : "-"}
-                    </strong>
+                    <strong>{selectedEdgeClockLabel}</strong>
                   </div>
                 </div>
               ) : (
@@ -1122,7 +1309,7 @@ function App() {
             <div className="patch-stats">
               <div>
                 <span>Nodes</span>
-                <strong>{markovNodes.length}</strong>
+                <strong>{editableNodes.length}</strong>
               </div>
               <div>
                 <span>Edges</span>
@@ -1130,7 +1317,7 @@ function App() {
               </div>
               <div>
                 <span>Routes</span>
-                <strong>{validClockEdges.length}</strong>
+                <strong>{validClockLanes.length}</strong>
               </div>
               <div>
                 <span>Active</span>

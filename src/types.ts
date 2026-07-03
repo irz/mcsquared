@@ -12,6 +12,10 @@ export const NODE_PORTS = {
   SELF_SOURCE: "self-source-top",
   SELF_TARGET: "self-target-top"
 } as const;
+export const SWING_PORTS = {
+  INPUT: "swing-input-left",
+  OUTPUT: "swing-output-right"
+} as const;
 
 export const NODE_BOX = {
   WIDTH: 146,
@@ -36,6 +40,8 @@ export type GraphNodeData = Record<string, unknown> & {
   sampleId?: SampleId;
   isActive?: boolean;
   bpm?: number;
+  swingAmount?: number;
+  swingChance?: number;
 };
 
 export type GraphEdgeData = Record<string, unknown> & {
@@ -44,7 +50,7 @@ export type GraphEdgeData = Record<string, unknown> & {
   clockDivision?: ClockDivision;
 };
 
-export type AppNode = Node<GraphNodeData, "markovNode" | "clockNode">;
+export type AppNode = Node<GraphNodeData, "markovNode" | "clockNode" | "swingNode">;
 export type AppEdge = Edge<GraphEdgeData, "probabilityEdge">;
 
 export type PatchState = {

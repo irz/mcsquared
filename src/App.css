@@ -390,6 +390,87 @@ input[type="range"] {
   background: #0f9f86;
 }
 
+.swing-node {
+  position: relative;
+  width: 156px;
+  min-height: 96px;
+  padding: 13px 14px 12px;
+  border: 2px solid #fffdf9;
+  border-radius: 8px;
+  background:
+    linear-gradient(135deg, rgba(139, 63, 209, 0.18), transparent 44%),
+    #fff8ff;
+  box-shadow:
+    0 14px 30px rgba(96, 45, 144, 0.17),
+    inset 0 0 0 1px rgba(139, 63, 209, 0.34);
+  color: #302239;
+}
+
+.swing-node.is-selected {
+  border-color: #8b3fd1;
+}
+
+.swing-node__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #7234ad;
+  font-size: 0.82rem;
+  font-weight: 850;
+  text-transform: uppercase;
+}
+
+.swing-node__header span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.swing-node__amount {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.swing-node__amount strong {
+  font-size: 1.52rem;
+  line-height: 1;
+}
+
+.swing-node__amount span {
+  color: #765987;
+  font-size: 0.72rem;
+  font-weight: 820;
+  white-space: nowrap;
+}
+
+.swing-node__meter {
+  height: 7px;
+  margin-top: 11px;
+  border-radius: 999px;
+  background: rgba(139, 63, 209, 0.18);
+  overflow: hidden;
+}
+
+.swing-node__meter span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #e85d2a, #8b3fd1);
+}
+
+.swing-node__handle--input {
+  left: -7px;
+  background: #0f9f86;
+}
+
+.swing-node__handle--output {
+  right: -7px;
+  background: #8b3fd1;
+}
+
 .node-handle {
   width: 12px;
   height: 12px;

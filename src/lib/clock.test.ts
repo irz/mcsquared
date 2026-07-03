@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { CLOCK_PORTS, MASTER_CLOCK_NODE_ID, type AppEdge } from "../types";
+import { CLOCK_PORTS, MASTER_CLOCK_NODE_ID, NODE_PORTS, SWING_PORTS, type AppEdge, type AppNode } from "../types";
 import {
+  clockLanes,
   clockDivisionFromHandle,
   divisionsForSixteenthTick,
   firstClockEdge,
@@ -26,6 +27,16 @@ const transitionEdge = (id: string): AppEdge => ({
   target: "b",
   type: "probabilityEdge",
   data: { edgeKind: "transition", probability: 1 }
+});
+
+const node = (id: string, type: AppNode["type"] = "markovNode"): AppNode => ({
+  id,
+  type,
+  position: { x: 0, y: 0 },
+  data: {
+    label: id,
+    ...(type === "swingNode" ? { swingAmount: 0.62, swingChance: 0.7 } : { sampleId: 1 })
+  }
 });
 
 describe("clock helpers", () => {
@@ -68,6 +79,53 @@ describe("clock helpers", () => {
     expect(reconciled.get("c1")).toBe("a");
     expect(reconciled.get("c2")).toBe("c");
     expect(reconciled.has("deleted-clock-edge")).toBe(false);
+  });
+
+  it("resolves direct and swing-routed clock lanes", () => {
+    const nodes = [
+      node(MASTER_CLOCK_NODE_ID, "clockNode"),
+      node("swing-a", "swingNode"),
+      node("kick"),
+      node("hat")
+    ];
+    const lanes = clockLanes(nodes, [
+      clockEdge("c1", "kick"),
+      {
+        id: "c2",
+        source: MASTER_CLOCK_NODE_ID,
+        target: "swing-a",
+        sourceHandle: CLOCK_PORTS.SIXTEENTH,
+        targetHandle: SWING_PORTS.INPUT,
+        type: "probabilityEdge",
+        data: { edgeKind: "clock", clockDivision: "sixteenth" }
+      },
+      {
+        id: "swing-out",
+        source: "swing-a",
+        target: "hat",
+        sourceHandle: SWING_PORTS.OUTPUT,
+        targetHandle: NODE_PORTS.INPUT,
+        type: "probabilityEdge",
+        data: { edgeKind: "clock" }
+      }
+    ]);
+
+    expect(lanes).toHaveLength(2);
+    expect(lanes[0]).toMatchObject({
+      id: "c1",
+      targetNodeId: "kick",
+      routeEdgeIds: ["c1"],
+      clockDivision: "quarter"
+    });
+    expect(lanes[1]).toMatchObject({
+      id: "c2:swing-out",
+      targetNodeId: "hat",
+      routeEdgeIds: ["c2", "swing-out"],
+      clockDivision: "sixteenth",
+      swingNodeId: "swing-a",
+      swingAmount: 0.62,
+      swingChance: 0.7
+    });
   });
 
   it("drops lanes whose clock targets were deleted", () => {
